@@ -3,6 +3,7 @@ import type { Register } from 'claude-code'
 import type { Check, Pr, Stored, View, Watched } from '../types'
 import { STEP_ICON, afterMergeChanges, afterMergeNames, discoverSteps, fmtDuration, median, progress, recordDurations, stepLabel } from './steps'
 import type { Deployment, Step, Suite } from './steps'
+import { STAGE_ICON, stagesFor } from './stages'
 
 // A GitHub PR URL in a prompt adds a line above the prompt that polls gh for the merge state and
 // the required checks; a prompt that is only the URL toggles it without a model turn. A PR URL in
@@ -41,8 +42,8 @@ const AFTER_MERGE = `
     }`
 export const queryFor = (steps: boolean) => `query($o: String!, $r: String!, $n: Int!) {
   repository(owner: $o, name: $r) { pullRequest(number: $n) {
-    number title state isDraft mergeable mergeStateStatus reviewDecision mergedAt closedAt${steps ? ' reviewRequests(first: 1) { totalCount } mergeQueueEntry { position state }' : ''}
-    commits(last: 1) { nodes { commit { statusCheckRollup { contexts(first: 100) { nodes {
+    number title state isDraft mergeable mergeStateStatus reviewDecision mergedAt closedAt headRefOid author { login }${steps ? ' reviewRequests(first: 1) { totalCount } mergeQueueEntry { position state }' : ''}
+    commits(last: 1) { nodes { commit { author { user { login } } statusCheckRollup { contexts(first: 100) { nodes {
       __typename
       ... on CheckRun { name status conclusion detailsUrl startedAt${steps ? ' completedAt' : ''} checkSuite { app { slug } workflowRun { event workflow { name } } } isRequired(pullRequestNumber: $n) }
       ... on StatusContext { context state targetUrl createdAt isRequired(pullRequestNumber: $n) }
@@ -193,7 +194,7 @@ export function statusText(pr: Pr, all = false): string {
 // off the latest review of each reviewer; and no workflow name or event on a check run.
 // the fields only "Show steps" asks for; absent otherwise and over REST
 type StepsFields = { reviewRequests?: { totalCount: number } | null; mergeQueueEntry?: { position?: number | null; state?: string | null } | null; mergeCommit?: { checkSuites?: { nodes?: unknown[] } | null; deployments?: { nodes?: unknown[] } | null } | null }
-type RestPull = { number: number; title: string; state: string; draft?: boolean; merged_at?: string | null; closed_at?: string | null; mergeable?: boolean | null; mergeable_state?: string; requested_reviewers?: unknown[]; requested_teams?: unknown[] }
+type RestPull = { number: number; title: string; state: string; draft?: boolean; merged_at?: string | null; closed_at?: string | null; mergeable?: boolean | null; mergeable_state?: string; requested_reviewers?: unknown[]; requested_teams?: unknown[]; user?: { login?: string } | null; head?: { sha?: string } | null }
 type RestRun = { name: string; status: string; conclusion?: string | null; details_url?: string | null; html_url?: string | null; started_at?: string | null; app?: { slug?: string } | null }
 type RestStatus = { context: string; state: string; target_url?: string | null; created_at?: string | null }
 type RestReview = { state: string; user?: { login?: string } | null }
@@ -214,7 +215,7 @@ export function reviewDecisionOf(reviews: RestReview[], pull: RestPull): string 
   if (states.includes('APPROVED')) return 'APPROVED'
   return pull.requested_reviewers?.length || pull.requested_teams?.length ? 'REVIEW_REQUIRED' : ''
 }
-export function fromRest(pull: RestPull, runs: RestRun[], statuses: RestStatus[], reviews: RestReview[], required: Set<string>) {
+export function fromRest(pull: RestPull, runs: RestRun[], statuses: RestStatus[], reviews: RestReview[], required: Set<string>, lastAuthor?: string) {
   const nodes: Context[] = [
     ...runs.map((c): Context => ({ __typename: 'CheckRun', isRequired: required.has(c.name), name: c.name, status: c.status.toUpperCase(), conclusion: c.conclusion?.toUpperCase() ?? null, detailsUrl: c.details_url || c.html_url || '', startedAt: c.started_at ?? null, checkSuite: { app: { slug: c.app?.slug } } })),
     ...statuses.map((s): Context => ({ __typename: 'StatusContext', isRequired: required.has(s.context), context: s.context, state: s.state.toUpperCase(), targetUrl: s.target_url ?? '', createdAt: s.created_at ?? null })),
@@ -226,7 +227,8 @@ export function fromRest(pull: RestPull, runs: RestRun[], statuses: RestStatus[]
     mergeable: pull.mergeable === true ? 'MERGEABLE' : pull.mergeable === false ? 'CONFLICTING' : 'UNKNOWN',
     mergeStateStatus: (pull.mergeable_state || 'unknown').toUpperCase(),
     reviewDecision: reviewDecisionOf(reviews, pull),
-    commits: { nodes: [{ commit: { statusCheckRollup: { contexts: { nodes } } } }] },
+    author: { login: pull.user?.login }, headRefOid: pull.head?.sha,
+    commits: { nodes: [{ commit: { author: { user: { login: lastAuthor } }, statusCheckRollup: { contexts: { nodes } } } }] },
   }
 }
 
@@ -288,6 +290,14 @@ let refresh: ((pr: Pr) => Promise<void>) | undefined
 let stop: ((pr: Pr) => void) | undefined
 let watch: ((m: RegExpExecArray, auto?: boolean, extra?: Partial<Pr>) => void) | undefined
 let openUrl: ((url: string) => void) | undefined
+// the gh user's login, read once per session: GitHub refuses an approval from the PR's author or
+// from whoever wrote its latest commit, so the approve button shows only where it can succeed
+let me: string | undefined
+let approve: ((pr: Pr) => Promise<void>) | undefined
+// a PR whose approve button was pressed once: the next press within 5 seconds approves and merges
+const armed = new Set<string>()
+export const canApprove = (v: View | undefined, login: string | undefined) =>
+  !!v && !!login && !!v.headSha && v.state === 'OPEN' && !v.isDraft && !!v.author && v.author !== login && !!v.lastAuthor && v.lastAuthor !== login
 let copy: ((text: string, surface?: 'terminal' | 'desktop' | 'vscode' | 'mobile') => void) | undefined
 let save: (() => void) | undefined
 let showStatus: (() => Promise<void>) | undefined
@@ -418,6 +428,33 @@ export const register: Register = (on, options) => {
       if (exitCode) throw new Error(stderr.trim() || `gh exited ${exitCode}`)
       return JSON.parse(stdout)
     }
+    $.process.run(['gh', 'api', 'user', '-q', '.login'], { timeoutMs: 30_000 })
+      .then(r => { me = r.exitCode ? undefined : r.stdout.trim() || undefined; $.ui.invalidate('ui.render') })
+      .catch(err => log(`gh api user failed: ${err}`))
+    // approves as the gh user, then merges with the repo's default method; --auto merges now when
+    // GitHub allows it, else enables auto-merge (or joins the merge queue) to merge once checks pass
+    approve = async pr => {
+      const run = async (args: string[]) => {
+        const r = await $.process.run(['gh', ...args], { timeoutMs: 60_000 })
+        if (r.exitCode) throw new Error(r.stderr.trim() || `gh exited ${r.exitCode}`)
+        return r.stdout.trim()
+      }
+      // biome-ignore lint/style/noNonNullAssertion: pr.url was built from a PR_URL match
+      const [, owner, repo, num] = PR_URL.exec(pr.url)!
+      // pinned to the head the row showed: a push since then fails both calls instead of
+      // approving and merging commits nobody looked at
+      const sha = pr.view?.headSha
+      if (!sha) return
+      try {
+        await run(['api', `repos/${owner}/${repo}/pulls/${num}/reviews`, '-f', 'event=APPROVE', '-f', `commit_id=${sha}`])
+        const method = (await run(['repo', 'view', `${owner}/${repo}`, '--json', 'viewerDefaultMergeMethod', '-q', '.viewerDefaultMergeMethod'])).toLowerCase()
+        await run(['pr', 'merge', pr.url, '--auto', '--match-head-commit', sha, `--${method === 'squash' || method === 'rebase' ? method : 'merge'}`])
+        $.ui.toast(`${pr.label} approved; merge requested`, { timeoutMs: 5000 })
+      } catch (err) {
+        $.ui.toast(`${pr.label}: ${err instanceof Error ? err.message : err}`, { timeoutMs: 8000 })
+      }
+      refresh?.(pr)
+    }
     // -f keeps owner and repo as strings (a repo named 2048 would otherwise be sent as a number)
     const viaGraphql = async (owner: string, repo: string, num: string) =>
       (await gh(['api', 'graphql', '-f', `query=${queryFor(cfg.showSteps)}`, '-f', `o=${owner}`, '-f', `r=${repo}`, '-F', `n=${num}`])).data?.repository?.pullRequest
@@ -427,14 +464,15 @@ export const register: Register = (on, options) => {
       const at = `repos/${owner}/${repo}`
       const pull = await gh(['api', `${at}/pulls/${num}`])
       const base = pull.base?.ref, sha = pull.head?.sha
-      const [runs, status, reviews, branch, rules] = await Promise.all([
+      const [runs, status, reviews, branch, rules, head] = await Promise.all([
         gh(['api', `${at}/commits/${sha}/check-runs?per_page=100`]),
         gh(['api', `${at}/commits/${sha}/status?per_page=100`]),
         gh(['api', `${at}/pulls/${num}/reviews?per_page=100`]),
         gh(['api', `${at}/branches/${base}`]).catch(() => undefined),
         gh(['api', `${at}/rules/branches/${base}`]).catch(() => undefined),
+        gh(['api', `${at}/commits/${sha}`]).catch(() => undefined),
       ])
-      return fromRest(pull, runs.check_runs ?? [], status.statuses ?? [], reviews ?? [], requiredOf(branch, rules))
+      return fromRest(pull, runs.check_runs ?? [], status.statuses ?? [], reviews ?? [], requiredOf(branch, rules), head?.author?.login)
     }
 
     // one poll per PR at a time: a second call while one runs gets that one
@@ -454,13 +492,13 @@ export const register: Register = (on, options) => {
         }
         if (rest) found = await viaRest(owner, repo, num)
         if (!found) throw new Error('PR not found')
-        const { number, commits, reviewRequests, mergeQueueEntry, mergeCommit, ...view } = found as ReturnType<typeof fromRest> & StepsFields
+        const { number, commits, reviewRequests, mergeQueueEntry, mergeCommit, author, headRefOid, ...view } = found as ReturnType<typeof fromRest> & StepsFields
         const contexts = latestPerName(commits.nodes[0]?.commit.statusCheckRollup?.contexts.nodes ?? [])
         const prev = pr.view
         const prevMerge = prev?.mergeStateStatus
         const all = cfg.allChecks
         const prevBuckets = new Map(counted(pr, all).map(c => [c.key, c.bucket]))
-        const v: View = { number, ...view, title: clean(view.title) }
+        const v: View = { number, ...view, title: clean(view.title), author: author?.login ?? undefined, lastAuthor: commits.nodes[0]?.commit.author?.user?.login ?? undefined, headSha: headRefOid ?? undefined }
         const wasDone = isDone(pr)
         // "Show steps": the PR's own steps from this same answer (GraphQL only; REST has no merge
         // commit runs in one call). The repo's history gives the stand-in after-merge steps and the
@@ -780,7 +818,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (!bandSeen.has(e.surface)) { bandSeen.add(e.surface); showStatus?.() }
     if (e.props.hasSurvey || (!flashing && !prs.size)) return next(e)
-    const { Box, Text, Link, Button } = await $.ui.resolve(e)
+    const { Box, Text, Button } = await $.ui.resolve(e)
     const cols = e.props.bodyColumns ?? e.viewport?.columns ?? 80
     const doneCount = [...prs.values()].filter(finished).length
     return (
@@ -800,6 +838,8 @@ export const register: Register = (on, options) => {
           // under "Show steps": step k/n, the percent, and the step it is on in place of the counts
           const prog = pr.progress?.n ? pr.progress : undefined
           const cur = prog?.current
+          // our pipeline's stages in place of the counts, every check counted, required or not
+          const stages = prog ? undefined : stagesFor(pr.id.split('#')[0], [...pr.required, ...pr.others])
           // the label is a Link (cmd+click opens the PR); the rest is one Text, truncated, title
           // last so it is what the width cuts; hovering the row reveals its buttons (no hotkeys:
           // a band hotkey would press on a digit typed as the first character of a prompt).
@@ -810,7 +850,8 @@ export const register: Register = (on, options) => {
           return (
             <Box key={`row:${pr.pane}`} flexDirection="row">
               <Box flexShrink={0}>
-                {done ? <Link href={pr.url}><Text dimColor strikethrough>{pr.label}</Text></Link> : <Link href={pr.url} label={pr.label} />}
+                {/* a Button, not a Link: a terminal without OSC 8 draws a Link's URL beside its text */}
+                <Button plain key={`id:${pr.pane}`} onPress={() => openUrl?.(pr.url)}>{done ? <Text dimColor strikethrough>{pr.label}</Text> : <Text color="cyan">{pr.label}</Text>}</Button>
               </Box>
               {done ? (
                 <Text wrap="truncate-end" strikethrough>
@@ -837,17 +878,31 @@ export const register: Register = (on, options) => {
                 <Text dimColor>{prog ? ` · step ${prog.k}/${prog.n} · ` : ' · '}</Text>
                 <Text color={prog?.failed ? 'red' : 'cyan'}>{prog ? `${prog.pct}%` : ''}</Text>
                 <Text color={cur ? STEP_ICON[cur.state][1] : 'gray'}>{cur ? ` · ${cur.name} ${STEP_ICON[cur.state][0]}` : ''}</Text>
-                <Text color="green">{prog ? '' : `✓${n('pass')}`}</Text>
-                <Text color="red">{!prog && n('fail') + n('cancel') ? ` ✗${n('fail') + n('cancel')}` : ''}</Text>
-                <Text color="yellow">{!prog && n('pending') ? ` ●${n('pending')}` : ''}</Text>
-                <Text color="red">{otherFails ? ` (+${otherFails} optional ✗)` : ''}</Text>
+                {stages ? stages.map((st, i) => (
+                  <Text color={STAGE_ICON[st.state][1]}>{`${i ? ' · ' : ''}${st.stage} ${STAGE_ICON[st.state][0]}`}</Text>
+                )) : <Text>
+                  <Text color="green">{prog ? '' : `✓${n('pass')}`}</Text>
+                  <Text color="red">{!prog && n('fail') + n('cancel') ? ` ✗${n('fail') + n('cancel')}` : ''}</Text>
+                  <Text color="yellow">{!prog && n('pending') ? ` ●${n('pending')}` : ''}</Text>
+                  <Text color="red">{otherFails ? ` (+${otherFails} optional ✗)` : ''}</Text>
+                </Text>}
                 <Text color="red">{pr.error ? ' · refresh failed' : ''}</Text>
                 <Text dimColor>{pr.muted || cfg.muteAll ? ' · muted' : ''}</Text>
                 <Text dimColor>{` · ${v.title}`}</Text>
               </Text>
               )}
+              {/* takes the free width, so the buttons sit at the right edge however short the line */}
+              <Box flexGrow={1} />
               <Box display="none" hover={{ display: 'flex' }} flexShrink={0} flexDirection="row">
-                <Button key={`open:${pr.pane}`} label="open" onPress={() => openUrl?.(pr.url)} />
+                {canApprove(v, me) ? (
+                  <Button key={`approve:${pr.pane}`} variant="primary" label={armed.has(pr.pane) ? 'confirm approve & merge' : 'approve & merge'} onPress={() => {
+                    if (!armed.has(pr.pane)) {
+                      armed.add(pr.pane)
+                      $.clock.after(5000, () => { armed.delete(pr.pane); $.ui.invalidate('ui.render') })
+                    } else { armed.delete(pr.pane); approve?.(pr) }
+                    $.ui.invalidate('ui.render')
+                  }} />
+                ) : <Box />}
                 <Button key={`copy:${pr.pane}`} label="copy" onPress={press => copy?.(pr.url, press.surface)} />
                 <Button key={`mute:${pr.pane}`} label={pr.muted ? 'unmute' : 'mute'} onPress={() => { pr.muted = !pr.muted; save?.(); $.ui.invalidate('ui.render') }} />
                 <Button key={`details:${pr.pane}`} label="details" onPress={() => { $.ui.open({ id: pr.pane, title: pr.id, focus: true, closeOnEscape: true }) }} />

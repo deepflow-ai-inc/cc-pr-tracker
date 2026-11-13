@@ -3,7 +3,7 @@ export type StepState = 'done' | 'running' | 'waiting' | 'failed' | 'skipped'
 export type Step = { key: string; name: string; phase: 'checks' | 'review' | 'queue' | 'merge' | 'after merge'; state: StepState; startedAt?: string; completedAt?: string; link?: string; expected?: boolean; optional?: boolean }
 export type Progress = { k: number; n: number; pct: number; current?: Step; failed?: Step; afterMergeFailed: boolean; settled: boolean }
 export type Check = { key: string; name: string; bucket: string; link: string }
-export type View = { number: number; title: string; state: string; isDraft: boolean; mergeable: string; mergeStateStatus: string; reviewDecision: string; mergedAt?: string | null; closedAt?: string | null }
+export type View = { number: number; title: string; state: string; isDraft: boolean; mergeable: string; mergeStateStatus: string; reviewDecision: string; mergedAt?: string | null; closedAt?: string | null; author?: string; lastAuthor?: string; headSha?: string }
 // auto: Claude brought it in (its answer, `gh pr create`), so a /clear drops it;
 // dropIfClosed: a merged or closed PR found on the first load is dropped instead of drawn;
 // doneAt: when a poll first saw it merged or closed, for "Stop watching after"

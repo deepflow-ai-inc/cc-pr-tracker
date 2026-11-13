@@ -22,7 +22,7 @@ const gql = (pr: Record<string, unknown> = {}, checks = [run('lint', null)]) => 
 // the engine beneath the plugin; `w` records what the plugin did and `w.response` is what gh prints
 // `old`: a build before 2.1.289, where $.session.root and $.ui.copy answer nothing
 function world(on: any, store: Record<string, unknown> = {}, { old = false } = {}) {
-  const w = { gh: 0, toasts: [] as string[], response: gql(), logs: [] as string[], opened: [] as Record<string, unknown>[], closed: [] as string[], copied: [] as { text: string; surface?: string }[], copyResult: { isCopied: true } as Record<string, unknown>, ghError: '', bashStdout: '', runs: [] as string[][], notes: [] as string[], surfaces: ['terminal'] as string[], status: [] as (string | undefined)[], hold: undefined as Promise<void> | undefined, surfacesHold: undefined as Promise<void> | undefined, state: undefined as unknown, sessionId: 's1', respond: (argv: string[]) => w.response, refuse: (_argv: string[]) => '' }
+  const w = { me: 'ali', gh: 0, toasts: [] as string[], response: gql(), logs: [] as string[], opened: [] as Record<string, unknown>[], closed: [] as string[], copied: [] as { text: string; surface?: string }[], copyResult: { isCopied: true } as Record<string, unknown>, ghError: '', bashStdout: '', runs: [] as string[][], notes: [] as string[], surfaces: ['terminal'] as string[], status: [] as (string | undefined)[], hold: undefined as Promise<void> | undefined, surfacesHold: undefined as Promise<void> | undefined, state: undefined as unknown, sessionId: 's1', respond: (argv: string[]) => w.response, refuse: (_argv: string[]) => '' }
   const clock = mock.clock(on)
   // $.store over `store` itself, so a test reads what the plugin wrote
   on('store.get', async (_$: unknown, e: any) => ({ value: store[e.key] }))
@@ -53,6 +53,8 @@ function world(on: any, store: Record<string, unknown> = {}, { old = false } = {
   if (!old) on('session.append', async (_$: unknown, e: any, next: any) => { w.notes.push(e.message.content[0].text); return next(e) })
   on('tool.register', ok({ tool: TOOL }))
   on('process.run', async (_$: unknown, e: any) => {
+    // the viewer's login, read once at start; not a poll, so neither recorded nor counted
+    if (e.argv.join(' ') === 'gh api user -q .login') return { value: { stdout: `${w.me}\n`, stderr: '', exitCode: 0 } }
     w.runs.push([...e.argv])
     if (e.argv[0] !== 'gh') return { value: { stdout: '', stderr: '', exitCode: 0 } }
     if (w.hold) await w.hold
@@ -567,7 +569,7 @@ for (const surface of ['terminal', 'desktop']) {
     expect(buttons.map((b: any) => b.key)).toEqual(['clear:pr-repo-7', 'clear:pr-repo-8'])
     expect(buttons.map((b: any) => b.props.label)).toEqual(['clear done (2)', 'clear done (2)'])
     await ui.press({ key: 'clear:pr-repo-8' })
-    expect((await ui.findAll({ type: 'Link' })).map((l: any) => l.text)).toEqual(['repo#9'])
+    expect((await ui.findAll({ type: 'Button' })).filter((b: any) => b.key.startsWith('id:')).map((b: any) => b.text)).toEqual(['repo#9'])
   })
 }
 
@@ -730,10 +732,12 @@ for (const surface of SURFACES) {
     await start($)
     await $.prompt.submit({ text: PR, wait: false })
     const ui = await band($, surface)
-    expect((await ui.find({ type: 'Link' }))?.text).toBe('repo#7')
+    // the ID opens the PR; no Link, whose URL a terminal without OSC 8 draws beside the text
+    expect((await ui.find({ key: 'id:pr-repo-7' }))?.text).toBe('repo#7')
+    expect(await ui.find({ type: 'Link' })).toBeUndefined()
     const shown = await texts(ui)
     for (const part of ['blocked', 'review required', '✓1', '●1', '(+1 optional ✗)', 'Fix it']) expect(shown).toContain(part)
-    expect((await ui.findAll({ type: 'Button' })).map((b: any) => b.key)).toEqual(['open:pr-repo-7', 'copy:pr-repo-7', 'mute:pr-repo-7', 'details:pr-repo-7', 'stop:pr-repo-7'])
+    expect((await ui.findAll({ type: 'Button' })).map((b: any) => b.key)).toEqual(['id:pr-repo-7', 'copy:pr-repo-7', 'mute:pr-repo-7', 'details:pr-repo-7', 'stop:pr-repo-7'])
   })
 
   test(`${surface}: a merged PR is one struck-through line`, async ($, on) => {
@@ -776,14 +780,61 @@ for (const surface of SURFACES) {
     expect(await texts(ui)).toContain('✗1')
   })
 
-  test(`${surface}: open opens the PR in the browser, from the line and from the panel`, async ($, on) => {
+  test(`${surface}: the ID opens the PR in the browser, from the line and from the panel`, async ($, on) => {
     const { w } = world(on)
     await start($)
     await $.prompt.submit({ text: PR, wait: false })
-    await (await band($, surface)).press({ key: 'open:pr-repo-7' })
+    await (await band($, surface)).press({ key: 'id:pr-repo-7' })
     const pane = await $.ui.mount({ plugin: 'cc-pr-tracker', surface, component: 'Pane', requestId: 'pr-repo-7', props: { title: 'org/repo#7', isFocused: true, bodyColumns: 80 } as any, viewport: { columns: 80, rows: 30 } })
     await pane.press({ key: 'pane-open:pr-repo-7' })
     expect(w.runs.filter(argv => argv[0] === 'open')).toEqual([['open', PR], ['open', PR]])
+  })
+
+  test(`${surface}: approve & merge shows only where the gh user may approve`, async ($, on) => {
+    const { w } = world(on)
+    const by = (author: string | null, last: string | null) => gql({ headRefOid: 'abc', author: author && { login: author }, commits: { nodes: [{ commit: { author: { user: last && { login: last } }, statusCheckRollup: { contexts: { nodes: [] } } } }] } })
+    const cases: [string | null, string | null, Record<string, unknown>, boolean][] = [
+      ['bot', 'bot', {}, true], ['ali', 'bot', {}, false], ['bot', 'ali', {}, false], [null, 'bot', {}, false], ['bot', null, {}, false],
+      ['bot', 'bot', { isDraft: true }, false], ['bot', 'bot', { headRefOid: null }, false], ['bot', 'bot', { state: 'MERGED' }, false],
+    ]
+    w.respond = argv => {
+      const n = Number(argv.find(a => a.startsWith('n='))?.slice(2))
+      const [author, last, extra] = cases[n - 1]
+      return JSON.stringify({ data: { repository: { pullRequest: { ...JSON.parse(by(author, last)).data.repository.pullRequest, number: n, ...extra } } } })
+    }
+    await start($)
+    await $.prompt.submit({ text: cases.map((_, i) => `https://github.com/org/repo/pull/${i + 1}`).join(' '), wait: false })
+    const ui = await band($, surface)
+    const shown = (await ui.findAll({ type: 'Button' })).map((b: any) => b.key).filter((k: string) => k.startsWith('approve:'))
+    expect(shown).toEqual(cases.flatMap(([, , , show], i) => show ? [`approve:pr-repo-${i + 1}`] : []))
+  })
+
+  test(`${surface}: approve & merge asks for a second press, then approves and merges with the repo's method`, async ($, on) => {
+    const { w } = world(on)
+    w.respond = argv => argv[1] === 'repo' ? 'SQUASH\n' : argv[1] === 'pr' || argv[2]?.endsWith('/reviews') ? '' : gql({ headRefOid: 'abc', author: { login: 'bot' }, commits: { nodes: [{ commit: { author: { user: { login: 'bot' } }, statusCheckRollup: { contexts: { nodes: [] } } } }] } })
+    await start($)
+    await $.prompt.submit({ text: PR, wait: false })
+    const ui = await band($, surface)
+    await ui.press({ key: 'approve:pr-repo-7' })
+    const acts = () => w.runs.filter(a => a[1] === 'pr' || a[2]?.endsWith('/reviews'))
+    expect(acts()).toEqual([])
+    expect((await ui.find({ key: 'approve:pr-repo-7' }))?.props.label).toBe('confirm approve & merge')
+    await ui.press({ key: 'approve:pr-repo-7' })
+    expect(acts()).toEqual([['gh', 'api', 'repos/org/repo/pulls/7/reviews', '-f', 'event=APPROVE', '-f', 'commit_id=abc'], ['gh', 'pr', 'merge', PR, '--auto', '--match-head-commit', 'abc', '--squash']])
+    expect(w.toasts).toContain('repo#7 approved; merge requested')
+  })
+
+  test(`${surface}: a deepflow PR shows its pipeline stages in place of the counts, buttons pushed right`, async ($, on) => {
+    const { w } = world(on)
+    const job = (workflow: string, name: string, conclusion: string | null) => ({ ...run(name, conclusion), checkSuite: { app: { slug: 'github-actions' }, workflowRun: { event: 'pull_request', workflow: { name: workflow } } } })
+    w.response = gql({}, [job('pr-checks', 'pr-checks', 'SUCCESS'), job('Deepflow ML Unit Tests', 'Deepflow ML / Unit tests', 'FAILURE'), job('preview', 'deploy', null)])
+    await start($)
+    await $.prompt.submit({ text: 'https://github.com/deepflow-ai-inc/deepflow/pull/7', wait: false })
+    const ui = await band($, surface)
+    const shown = await texts(ui)
+    for (const part of ['checks ✓', 'unit ✗', 'preview ●', 'e2e –']) expect(shown).toContain(part)
+    expect(shown).not.toContain('✓1')
+    expect((await ui.findAll({ type: 'Box' })).some((b: any) => b.props.flexGrow === 1)).toBe(true)
   })
 
   test(`${surface}: × stops watching and removes the line`, async ($, on) => {
