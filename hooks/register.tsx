@@ -3,6 +3,7 @@ import type { Register } from 'claude-code'
 import type { Check, Pr, Stored, View, Watched } from '../types'
 import { STEP_ICON, afterMergeChanges, afterMergeNames, discoverSteps, fmtDuration, median, progress, recordDurations, stepLabel } from './steps'
 import type { Deployment, Step, Suite } from './steps'
+import { STAGE_ICON, stagesFor } from './stages'
 
 // A GitHub PR URL in a prompt adds a line above the prompt that polls gh for the merge state and
 // the required checks; a prompt that is only the URL toggles it without a model turn. A PR URL in
@@ -837,6 +838,8 @@ export const register: Register = (on, options) => {
           // under "Show steps": step k/n, the percent, and the step it is on in place of the counts
           const prog = pr.progress?.n ? pr.progress : undefined
           const cur = prog?.current
+          // our pipeline's stages in place of the counts, every check counted, required or not
+          const stages = prog ? undefined : stagesFor(pr.id.split('#')[0], [...pr.required, ...pr.others])
           // the label is a Link (cmd+click opens the PR); the rest is one Text, truncated, title
           // last so it is what the width cuts; hovering the row reveals its buttons (no hotkeys:
           // a band hotkey would press on a digit typed as the first character of a prompt).
@@ -875,15 +878,21 @@ export const register: Register = (on, options) => {
                 <Text dimColor>{prog ? ` · step ${prog.k}/${prog.n} · ` : ' · '}</Text>
                 <Text color={prog?.failed ? 'red' : 'cyan'}>{prog ? `${prog.pct}%` : ''}</Text>
                 <Text color={cur ? STEP_ICON[cur.state][1] : 'gray'}>{cur ? ` · ${cur.name} ${STEP_ICON[cur.state][0]}` : ''}</Text>
-                <Text color="green">{prog ? '' : `✓${n('pass')}`}</Text>
-                <Text color="red">{!prog && n('fail') + n('cancel') ? ` ✗${n('fail') + n('cancel')}` : ''}</Text>
-                <Text color="yellow">{!prog && n('pending') ? ` ●${n('pending')}` : ''}</Text>
-                <Text color="red">{otherFails ? ` (+${otherFails} optional ✗)` : ''}</Text>
+                {stages ? stages.map((st, i) => (
+                  <Text color={STAGE_ICON[st.state][1]}>{`${i ? ' · ' : ''}${st.stage} ${STAGE_ICON[st.state][0]}`}</Text>
+                )) : <Text>
+                  <Text color="green">{prog ? '' : `✓${n('pass')}`}</Text>
+                  <Text color="red">{!prog && n('fail') + n('cancel') ? ` ✗${n('fail') + n('cancel')}` : ''}</Text>
+                  <Text color="yellow">{!prog && n('pending') ? ` ●${n('pending')}` : ''}</Text>
+                  <Text color="red">{otherFails ? ` (+${otherFails} optional ✗)` : ''}</Text>
+                </Text>}
                 <Text color="red">{pr.error ? ' · refresh failed' : ''}</Text>
                 <Text dimColor>{pr.muted || cfg.muteAll ? ' · muted' : ''}</Text>
                 <Text dimColor>{` · ${v.title}`}</Text>
               </Text>
               )}
+              {/* takes the free width, so the buttons sit at the right edge however short the line */}
+              <Box flexGrow={1} />
               <Box display="none" hover={{ display: 'flex' }} flexShrink={0} flexDirection="row">
                 {canApprove(v, me) ? (
                   <Button key={`approve:${pr.pane}`} variant="primary" label={armed.has(pr.pane) ? 'confirm approve & merge' : 'approve & merge'} onPress={() => {

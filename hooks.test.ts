@@ -824,6 +824,19 @@ for (const surface of SURFACES) {
     expect(w.toasts).toContain('repo#7 approved; merge requested')
   })
 
+  test(`${surface}: a deepflow PR shows its pipeline stages in place of the counts, buttons pushed right`, async ($, on) => {
+    const { w } = world(on)
+    const job = (workflow: string, name: string, conclusion: string | null) => ({ ...run(name, conclusion), checkSuite: { app: { slug: 'github-actions' }, workflowRun: { event: 'pull_request', workflow: { name: workflow } } } })
+    w.response = gql({}, [job('pr-checks', 'pr-checks', 'SUCCESS'), job('Deepflow ML Unit Tests', 'Deepflow ML / Unit tests', 'FAILURE'), job('preview', 'deploy', null)])
+    await start($)
+    await $.prompt.submit({ text: 'https://github.com/deepflow-ai-inc/deepflow/pull/7', wait: false })
+    const ui = await band($, surface)
+    const shown = await texts(ui)
+    for (const part of ['checks ✓', 'unit ✗', 'preview ●', 'e2e –']) expect(shown).toContain(part)
+    expect(shown).not.toContain('✓1')
+    expect((await ui.findAll({ type: 'Box' })).some((b: any) => b.props.flexGrow === 1)).toBe(true)
+  })
+
   test(`${surface}: × stops watching and removes the line`, async ($, on) => {
     world(on)
     await start($)
