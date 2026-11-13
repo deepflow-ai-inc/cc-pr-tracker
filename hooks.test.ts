@@ -792,10 +792,10 @@ for (const surface of SURFACES) {
 
   test(`${surface}: approve & merge shows only where the gh user may approve`, async ($, on) => {
     const { w } = world(on)
-    const by = (author: string | null, last: string | null) => gql({ author: author && { login: author }, commits: { nodes: [{ commit: { author: { user: last && { login: last } }, statusCheckRollup: { contexts: { nodes: [] } } } }] } })
+    const by = (author: string | null, last: string | null) => gql({ headRefOid: 'abc', author: author && { login: author }, commits: { nodes: [{ commit: { author: { user: last && { login: last } }, statusCheckRollup: { contexts: { nodes: [] } } } }] } })
     const cases: [string | null, string | null, Record<string, unknown>, boolean][] = [
       ['bot', 'bot', {}, true], ['ali', 'bot', {}, false], ['bot', 'ali', {}, false], [null, 'bot', {}, false], ['bot', null, {}, false],
-      ['bot', 'bot', { isDraft: true }, false], ['bot', 'bot', { state: 'MERGED' }, false],
+      ['bot', 'bot', { isDraft: true }, false], ['bot', 'bot', { headRefOid: null }, false], ['bot', 'bot', { state: 'MERGED' }, false],
     ]
     w.respond = argv => {
       const n = Number(argv.find(a => a.startsWith('n='))?.slice(2))
@@ -811,15 +811,16 @@ for (const surface of SURFACES) {
 
   test(`${surface}: approve & merge asks for a second press, then approves and merges with the repo's method`, async ($, on) => {
     const { w } = world(on)
-    w.respond = argv => argv[1] === 'repo' ? 'SQUASH\n' : argv[1] === 'pr' ? '' : gql({ author: { login: 'bot' }, commits: { nodes: [{ commit: { author: { user: { login: 'bot' } }, statusCheckRollup: { contexts: { nodes: [] } } } }] } })
+    w.respond = argv => argv[1] === 'repo' ? 'SQUASH\n' : argv[1] === 'pr' || argv[2]?.endsWith('/reviews') ? '' : gql({ headRefOid: 'abc', author: { login: 'bot' }, commits: { nodes: [{ commit: { author: { user: { login: 'bot' } }, statusCheckRollup: { contexts: { nodes: [] } } } }] } })
     await start($)
     await $.prompt.submit({ text: PR, wait: false })
     const ui = await band($, surface)
     await ui.press({ key: 'approve:pr-repo-7' })
-    expect(w.runs.filter(a => a[1] === 'pr')).toEqual([])
+    const acts = () => w.runs.filter(a => a[1] === 'pr' || a[2]?.endsWith('/reviews'))
+    expect(acts()).toEqual([])
     expect((await ui.find({ key: 'approve:pr-repo-7' }))?.props.label).toBe('confirm approve & merge')
     await ui.press({ key: 'approve:pr-repo-7' })
-    expect(w.runs.filter(a => a[1] === 'pr')).toEqual([['gh', 'pr', 'review', PR, '--approve'], ['gh', 'pr', 'merge', PR, '--auto', '--squash']])
+    expect(acts()).toEqual([['gh', 'api', 'repos/org/repo/pulls/7/reviews', '-f', 'event=APPROVE', '-f', 'commit_id=abc'], ['gh', 'pr', 'merge', PR, '--auto', '--match-head-commit', 'abc', '--squash']])
     expect(w.toasts).toContain('repo#7 approved; merge requested')
   })
 

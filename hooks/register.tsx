@@ -41,7 +41,7 @@ const AFTER_MERGE = `
     }`
 export const queryFor = (steps: boolean) => `query($o: String!, $r: String!, $n: Int!) {
   repository(owner: $o, name: $r) { pullRequest(number: $n) {
-    number title state isDraft mergeable mergeStateStatus reviewDecision mergedAt closedAt author { login }${steps ? ' reviewRequests(first: 1) { totalCount } mergeQueueEntry { position state }' : ''}
+    number title state isDraft mergeable mergeStateStatus reviewDecision mergedAt closedAt headRefOid author { login }${steps ? ' reviewRequests(first: 1) { totalCount } mergeQueueEntry { position state }' : ''}
     commits(last: 1) { nodes { commit { author { user { login } } statusCheckRollup { contexts(first: 100) { nodes {
       __typename
       ... on CheckRun { name status conclusion detailsUrl startedAt${steps ? ' completedAt' : ''} checkSuite { app { slug } workflowRun { event workflow { name } } } isRequired(pullRequestNumber: $n) }
@@ -193,7 +193,7 @@ export function statusText(pr: Pr, all = false): string {
 // off the latest review of each reviewer; and no workflow name or event on a check run.
 // the fields only "Show steps" asks for; absent otherwise and over REST
 type StepsFields = { reviewRequests?: { totalCount: number } | null; mergeQueueEntry?: { position?: number | null; state?: string | null } | null; mergeCommit?: { checkSuites?: { nodes?: unknown[] } | null; deployments?: { nodes?: unknown[] } | null } | null }
-type RestPull = { number: number; title: string; state: string; draft?: boolean; merged_at?: string | null; closed_at?: string | null; mergeable?: boolean | null; mergeable_state?: string; requested_reviewers?: unknown[]; requested_teams?: unknown[]; user?: { login?: string } | null }
+type RestPull = { number: number; title: string; state: string; draft?: boolean; merged_at?: string | null; closed_at?: string | null; mergeable?: boolean | null; mergeable_state?: string; requested_reviewers?: unknown[]; requested_teams?: unknown[]; user?: { login?: string } | null; head?: { sha?: string } | null }
 type RestRun = { name: string; status: string; conclusion?: string | null; details_url?: string | null; html_url?: string | null; started_at?: string | null; app?: { slug?: string } | null }
 type RestStatus = { context: string; state: string; target_url?: string | null; created_at?: string | null }
 type RestReview = { state: string; user?: { login?: string } | null }
@@ -226,7 +226,7 @@ export function fromRest(pull: RestPull, runs: RestRun[], statuses: RestStatus[]
     mergeable: pull.mergeable === true ? 'MERGEABLE' : pull.mergeable === false ? 'CONFLICTING' : 'UNKNOWN',
     mergeStateStatus: (pull.mergeable_state || 'unknown').toUpperCase(),
     reviewDecision: reviewDecisionOf(reviews, pull),
-    author: { login: pull.user?.login },
+    author: { login: pull.user?.login }, headRefOid: pull.head?.sha,
     commits: { nodes: [{ commit: { author: { user: { login: lastAuthor } }, statusCheckRollup: { contexts: { nodes } } } }] },
   }
 }
@@ -296,7 +296,7 @@ let approve: ((pr: Pr) => Promise<void>) | undefined
 // a PR whose approve button was pressed once: the next press within 5 seconds approves and merges
 const armed = new Set<string>()
 export const canApprove = (v: View | undefined, login: string | undefined) =>
-  !!v && !!login && v.state === 'OPEN' && !v.isDraft && !!v.author && v.author !== login && !!v.lastAuthor && v.lastAuthor !== login
+  !!v && !!login && !!v.headSha && v.state === 'OPEN' && !v.isDraft && !!v.author && v.author !== login && !!v.lastAuthor && v.lastAuthor !== login
 let copy: ((text: string, surface?: 'terminal' | 'desktop' | 'vscode' | 'mobile') => void) | undefined
 let save: (() => void) | undefined
 let showStatus: (() => Promise<void>) | undefined
@@ -439,11 +439,15 @@ export const register: Register = (on, options) => {
         return r.stdout.trim()
       }
       // biome-ignore lint/style/noNonNullAssertion: pr.url was built from a PR_URL match
-      const [, owner, repo] = PR_URL.exec(pr.url)!
+      const [, owner, repo, num] = PR_URL.exec(pr.url)!
+      // pinned to the head the row showed: a push since then fails both calls instead of
+      // approving and merging commits nobody looked at
+      const sha = pr.view?.headSha
+      if (!sha) return
       try {
-        await run(['pr', 'review', pr.url, '--approve'])
+        await run(['api', `repos/${owner}/${repo}/pulls/${num}/reviews`, '-f', 'event=APPROVE', '-f', `commit_id=${sha}`])
         const method = (await run(['repo', 'view', `${owner}/${repo}`, '--json', 'viewerDefaultMergeMethod', '-q', '.viewerDefaultMergeMethod'])).toLowerCase()
-        await run(['pr', 'merge', pr.url, '--auto', `--${method === 'squash' || method === 'rebase' ? method : 'merge'}`])
+        await run(['pr', 'merge', pr.url, '--auto', '--match-head-commit', sha, `--${method === 'squash' || method === 'rebase' ? method : 'merge'}`])
         $.ui.toast(`${pr.label} approved; merge requested`, { timeoutMs: 5000 })
       } catch (err) {
         $.ui.toast(`${pr.label}: ${err instanceof Error ? err.message : err}`, { timeoutMs: 8000 })
@@ -487,13 +491,13 @@ export const register: Register = (on, options) => {
         }
         if (rest) found = await viaRest(owner, repo, num)
         if (!found) throw new Error('PR not found')
-        const { number, commits, reviewRequests, mergeQueueEntry, mergeCommit, author, ...view } = found as ReturnType<typeof fromRest> & StepsFields
+        const { number, commits, reviewRequests, mergeQueueEntry, mergeCommit, author, headRefOid, ...view } = found as ReturnType<typeof fromRest> & StepsFields
         const contexts = latestPerName(commits.nodes[0]?.commit.statusCheckRollup?.contexts.nodes ?? [])
         const prev = pr.view
         const prevMerge = prev?.mergeStateStatus
         const all = cfg.allChecks
         const prevBuckets = new Map(counted(pr, all).map(c => [c.key, c.bucket]))
-        const v: View = { number, ...view, title: clean(view.title), author: author?.login ?? undefined, lastAuthor: commits.nodes[0]?.commit.author?.user?.login ?? undefined }
+        const v: View = { number, ...view, title: clean(view.title), author: author?.login ?? undefined, lastAuthor: commits.nodes[0]?.commit.author?.user?.login ?? undefined, headSha: headRefOid ?? undefined }
         const wasDone = isDone(pr)
         // "Show steps": the PR's own steps from this same answer (GraphQL only; REST has no merge
         // commit runs in one call). The repo's history gives the stand-in after-merge steps and the
